@@ -474,26 +474,33 @@ def BiRNN(batch_x, seq_length, dropout):
     # Output shape: [n_steps, batch_size, n_hidden_6]
     return layer_6
 
-if not os.path.exists(os.path.abspath(FLAGS.decoder_library_path)):
-    print('ERROR: The decoder library file does not exist. Make sure you have ' \
-          'downloaded or built the native client binaries and pass the ' \
-          'appropriate path to the binaries in the --decoder_library_path parameter.')
+custom_op_module = None
+if os.path.isfile(os.path.abspath(FLAGS.decoder_library_path)):
+    custom_op_module = tf.load_op_library(FLAGS.decoder_library_path)
+else:
+    log_warn('The decoder library file does not exist. Make sure you have ' \
+             'downloaded or built the native client binaries and pass the ' \
+             'appropriate path to the binaries in the --decoder_library_path parameter. ' \
+             'tf.nn.ctc_beam_search_decoder will be used.')
 
-custom_op_module = tf.load_op_library(FLAGS.decoder_library_path)
 
-def decode_with_lm(inputs, sequence_length, beam_width=100,
-                   top_paths=1, merge_repeated=True):
-  decoded_ixs, decoded_vals, decoded_shapes, log_probabilities = (
-      custom_op_module.ctc_beam_search_decoder_with_lm(
-          inputs, sequence_length, beam_width=beam_width,
-          model_path=FLAGS.lm_binary_path, trie_path=FLAGS.lm_trie_path, alphabet_path=FLAGS.alphabet_config_path,
-          lm_weight=FLAGS.lm_weight, word_count_weight=FLAGS.word_count_weight, valid_word_count_weight=FLAGS.valid_word_count_weight,
-          top_paths=top_paths, merge_repeated=merge_repeated))
+def decoder(inputs, sequence_length, beam_width=100,
+            top_paths=1, merge_repeated=True):
+    if not custom_op_module:
+        return tf.nn.ctc_beam_search_decoder(inputs, sequence_length, beam_width=beam_width,
+                                             top_paths=top_paths, merge_repeated=merge_repeated)
 
-  return (
-      [tf.SparseTensor(ix, val, shape) for (ix, val, shape)
-       in zip(decoded_ixs, decoded_vals, decoded_shapes)],
-      log_probabilities)
+    decoded_ixs, decoded_vals, decoded_shapes, log_probabilities = (
+        custom_op_module.ctc_beam_search_decoder_with_lm(
+            inputs, sequence_length, beam_width=beam_width,
+            model_path=FLAGS.lm_binary_path, trie_path=FLAGS.lm_trie_path, alphabet_path=FLAGS.alphabet_config_path,
+            lm_weight=FLAGS.lm_weight, word_count_weight=FLAGS.word_count_weight, valid_word_count_weight=FLAGS.valid_word_count_weight,
+            top_paths=top_paths, merge_repeated=merge_repeated))
+
+    return (
+        [tf.SparseTensor(ix, val, shape) for (ix, val, shape)
+         in zip(decoded_ixs, decoded_vals, decoded_shapes)],
+        log_probabilities)
 
 
 
@@ -529,7 +536,7 @@ def calculate_mean_edit_distance_and_loss(model_feeder, tower, dropout):
     avg_loss = tf.reduce_mean(total_loss)
 
     # Beam search decode the batch
-    decoded, _ = decode_with_lm(logits, batch_seq_len, merge_repeated=False, beam_width=FLAGS.beam_width)
+    decoded, _ = decoder(logits, batch_seq_len, merge_repeated=False, beam_width=FLAGS.beam_width)
 
     # Compute the edit (Levenshtein) distance
     distance = tf.edit_distance(tf.cast(decoded[0], tf.int32), batch_y)
@@ -1654,7 +1661,7 @@ def train(server=None):
                   ' or removing the contents of {0}.'.format(FLAGS.checkpoint_dir))
         sys.exit(1)
 
-def create_inference_graph(batch_size=None, output_is_logits=False, use_new_decoder=False):
+def create_inference_graph(batch_size=None, output_is_logits=False):
     # Input tensor will be of shape [batch_size, n_steps, n_input + 2*n_input*n_context]
     input_tensor = tf.placeholder(tf.float32, [batch_size, None, n_input + 2*n_input*n_context], name='input_node')
     seq_length = tf.placeholder(tf.int32, [batch_size], name='input_lengths')
@@ -1664,9 +1671,6 @@ def create_inference_graph(batch_size=None, output_is_logits=False, use_new_deco
 
     if output_is_logits:
         return logits
-
-    # Beam search decode the batch
-    decoder = decode_with_lm if use_new_decoder else tf.nn.ctc_beam_search_decoder
 
     decoded, _ = decoder(logits, seq_length, merge_repeated=False, beam_width=FLAGS.beam_width)
     decoded = tf.convert_to_tensor(
@@ -1749,7 +1753,7 @@ def export():
 
 def do_single_file_inference(input_file_path):
     with tf.Session(config=session_config) as session:
-        inputs, outputs = create_inference_graph(batch_size=1, use_new_decoder=True)
+        inputs, outputs = create_inference_graph(batch_size=1)
 
         # Create a saver using variables from the above newly created graph
         saver = tf.train.Saver(tf.global_variables())
